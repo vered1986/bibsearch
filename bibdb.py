@@ -3,6 +3,7 @@ import os.path
 import pybtex.database as pybtex
 import sqlite3
 import yaml
+import sys
 
 from typing import Tuple
 

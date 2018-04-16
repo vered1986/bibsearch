@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import feedparser
 from typing import List
 import urllib.request
 import pybtex.database as pybtex
@@ -22,6 +23,10 @@ import tempfile
 import textwrap
 from tqdm import tqdm
 import yaml
+import json
+import textract
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 from bibdb import BibDB
 import bibutils
@@ -224,8 +229,6 @@ def get_fnames_from_bibset(raw_fname, database_url):
 
 
 def _arxiv(args, config):
-    import feedparser
-
     db = BibDB(config)
 
     query = 'http://export.arxiv.org/api/query?{}'.format(urllib.parse.urlencode({ 'search_query': ' AND '.join(args.query)}))
@@ -247,36 +250,7 @@ def _arxiv(args, config):
     # Run through each entry, and print out information
     results_to_save = []
     for entry in feed.entries:
-
-        arxiv_id = re.sub(r'v\d+$', '', entry.id.split('/abs/')[-1])
-
-        fields = { 'title': entry.title,
-                   'journal': 'Computing Research Repository',
-                   'year': str(entry.published[:4]),
-                   'abstract': entry.summary,
-                   'volume': 'abs/{}'.format(arxiv_id),
-                   'archivePrefix': 'arXiv',
-                   'eprint': arxiv_id,
-        }
-
-        try:
-            fields['comment'] = entry.arxiv_comment
-        except AttributeError:
-            pass
-
-        # get the links to the pdf
-        for link in entry.links:
-            try:
-                if link.title == 'pdf':
-                    fields['url'] = link.href
-            except:
-                pass
-
-        authors = {'author': [pybtex.Person(author.name) for author in entry.authors]}
-        bib_entry = pybtex.Entry('article', persons=authors, fields=fields)
-        bib_entry.key = bibutils.generate_custom_key(bib_entry, config.custom_key_format)
-
-        format_search_results( [(bibutils.single_entry_to_fulltext(bib_entry), arxiv_id)], False, True)
+        arxiv_id, bib_entry = arxiv_entry_to_bib_entry(config.custom_key_format, entry)
 
         if args.add:
             db.add(bib_entry)
@@ -288,6 +262,34 @@ def _arxiv(args, config):
 
     if args.add:
         db.save()
+
+
+def arxiv_entry_to_bib_entry(custom_key_format, entry):
+    arxiv_id = re.sub(r'v\d+$', '', entry.id.split('/abs/')[-1])
+    fields = {'title': entry.title,
+              'journal': 'Computing Research Repository',
+              'year': str(entry.published[:4]),
+              'abstract': entry.summary,
+              'volume': 'abs/{}'.format(arxiv_id),
+              'archivePrefix': 'arXiv',
+              'eprint': arxiv_id,
+              }
+    try:
+        fields['comment'] = entry.arxiv_comment
+    except AttributeError:
+        pass
+    # get the links to the pdf
+    for link in entry.links:
+        try:
+            if link.title == 'pdf':
+                fields['url'] = link.href
+        except:
+            pass
+    authors = {'author': [pybtex.Person(author.name) for author in entry.authors]}
+    bib_entry = pybtex.Entry('article', persons=authors, fields=fields)
+    bib_entry.key = bibutils.generate_custom_key(bib_entry, custom_key_format)
+    format_search_results([(bibutils.single_entry_to_fulltext(bib_entry), arxiv_id)], False, True)
+    return arxiv_id, bib_entry
 
 
 def _remove(args, config):
@@ -495,6 +497,252 @@ def _edit(args, config):
     else:
         print("Aborted.")
 
+
+def _crawl(args, config):
+    """
+    Crawls a web site for links of papers and returns their bib files.
+    Bib entries are retrieved from ACL anthology, Semantic Scholar, and arXiv.
+    :return:
+    """
+    #TODO: handle duplicate entries
+    db = BibDB(config)
+
+    # Read the references
+    in_url = args.url
+    logging.debug('Reading references from {}'.format(in_url))
+    page = urllib.request.urlopen(in_url)
+    soup = BeautifulSoup(page, 'html.parser')
+    links = filter(None, [link.get('href') for link in soup.findAll('a')])
+
+    # Resolve relative URLs
+    links = [link if 'www' in link or 'http' in link else urljoin(in_url, link) for link in links]
+    links = list(set(links))
+    logging.debug('Found {} links'.format(len(links)))
+
+    # Save references as a dictionary with the normalized title as a key,
+    # to prevent duplicate entries (i.e. especially from bib and paper links)
+    entries = []
+    for link in links:
+        entries = get_bib_entry(entries, link, config, db)
+
+    # Run through each entry, and print out information
+    results_to_save = []
+    for bib_entry in entries:
+        if args.add:
+            db.add(bib_entry)
+        results_to_save.append((bibutils.single_entry_to_fulltext(bib_entry), bib_entry.key))
+        # else:
+        #     results_to_save.append((bibutils.single_entry_to_fulltext(bib_entry), bib_entry.fields['key']))
+
+        print(format_search_results(results_to_save))
+        db.save_to_search_cache(results_to_save)
+
+    if args.add:
+        db.save()
+
+
+def get_bib_entry(entries, url, config, db):
+    """
+    Gets a URL to a publication and tries to extract a bib entry for it
+    Updates entries with the new found entries
+    :param url: the URL to extract a publication from
+    """
+    lowercased_url = url.lower()
+    filename = lowercased_url.split('/')[-1]
+
+    # Only try to open papers with extension pdf or bib or without extension
+    if '.' in filename and not filename.endswith('.pdf') and not filename.endswith('.bib'):
+        return entries
+
+    # If ends with bib, add its entries
+    if filename.endswith('.bib'):
+        entries.extend(import_bib_file(url))
+        return entries
+
+    # A pdf file
+    paper_id = filename.replace('.pdf', '')
+
+    # Paper from TACL
+    if 'transacl.org' in lowercased_url or 'tacl' in lowercased_url:
+        entries.extend(get_bib_from_tacl(paper_id))
+        return entries
+
+    # If arXiv URL, get paper details from arXiv
+    if 'arxiv.org' in lowercased_url:
+        arxiv_entry = get_from_arxiv(paper_id, config.custom_key_format)
+        curr_entries = []
+
+        # First, try searching for the title in the ACL anthology. If the paper
+        # was published in a *CL conference, it should be cited from there and not from arXiv
+        if len(arxiv_entry) > 0:
+            acl_entry = db.search(arxiv_entry[0].fields['title'])
+            if len(acl_entry) > 0:
+                curr_entries = acl_entry[:1]
+            else:
+                curr_entries = arxiv_entry[:1]
+
+        entries.extend(curr_entries)
+        return entries
+
+    # If the URL is from the ACL anthology, take it by ID
+    if 'aclanthology' in lowercased_url or 'aclweb.org' in lowercased_url:
+        # TODO: make sure the ACL anthology is downloaded in the beginning of this command?
+        acl_entry = db.search_key(paper_id)
+        if acl_entry is not None:
+            entries.append(acl_entry)
+        return entries
+
+    # If the URL is from Semantic Scholar
+    if 'semanticscholar.org' in lowercased_url and not lowercased_url.endswith('pdf'):
+        semantic_scholar_entry = get_bib_from_semantic_scholar(url)
+        curr_entries = []
+
+        # First, try searching for the title in the ACL anthology. If the paper
+        # was published in a *CL conference, it should be cited from there and not from Semantic Scholar
+        if len(semantic_scholar_entry) > 0:
+            acl_entry = db.search(semantic_scholar_entry[0].fields['title'])
+            if len(acl_entry) > 0:
+                curr_entries = acl_entry[:1]
+            else:
+                curr_entries = semantic_scholar_entry[:1]
+
+        entries.extend(curr_entries)
+        return entries
+
+    # Else: try to read the pdf and find it in the acl anthology by the title
+    if lowercased_url.endswith('pdf'):
+        title = get_title_from_pdf(url, config.temp_dir)
+
+        if title is not None:
+            acl_entry = db.search(title)
+            if acl_entry is not None:
+                entries.append(acl_entry)
+
+    # Didn't find
+    logging.debug('Could not find {}'.format(url))
+    return entries
+
+
+def import_bib_file(url):
+    """
+    Gets a bib file and returns a list of pybtex.database.BibliographyData with a single bib entry
+    :param url: the URL of the bib file
+    :return: a list of pybtex.database.BibliographyData with a single bib entry or an empty list
+    if not found / an error occurred
+    """
+    try:
+        entries = pybtex.parse_string(download_file(url), bib_format="bibtex").entries.values()
+        return entries
+    except urllib.error.URLError as e:
+        logging.warning("Error downloading '%s' [%s]" % (url, str(e)))
+    except pybtex.PybtexError:
+        logging.warning("Error parsing file %s" % url)
+
+    return []
+
+
+def get_bib_from_tacl(paper_id):
+    """
+    Gets a TACL paper page and returns a list of pybtex.database.BibliographyData with a single bib entry
+    :param paper_id: TACL paper ID
+    :return: a list of pybtex.database.BibliographyData with a single bib entry or an empty list
+    if not found / an error occurred
+    """
+    url = 'https://transacl.org/ojs/index.php/tacl/rt/captureCite/{id}/0/BibtexCitationPlugin'.format(id=paper_id)
+
+    try:
+        page = urllib.request.urlopen(url)
+        soup = BeautifulSoup(page, 'html.parser')
+        bib_entry = soup.find('pre').string
+        return pybtex.parse_string(bib_entry, bib_format="bibtex").entries.values()
+    except:
+        return []
+
+
+def get_from_arxiv(paper_id, custom_key_format=True):
+    """
+    Gets an arXiv paper page and returns a list of pybtex.database.BibliographyData with a single bib entry
+    :param paper_id: arXiv paper ID
+    :return: a list of pybtex.database.BibliographyData with a single bib entry or an empty list
+    if not found / an error occurred
+    """
+    entries = []
+
+    try:
+        query = 'http://export.arxiv.org/api/query?{}'.format(
+            urllib.parse.urlencode({'id_list': paper_id, 'max_results': 1}))
+        response = download_file(query)
+
+        feedparser._FeedParserMixin.namespaces['http://a9.com/-/spec/opensearch/1.1/'] = 'opensearch'
+        feedparser._FeedParserMixin.namespaces['http://arxiv.org/schemas/atom'] = 'arxiv'
+        feed = feedparser.parse(response)
+
+
+        if len(feed.entries) > 0:
+            arxiv_id, bib_entry = arxiv_entry_to_bib_entry(custom_key_format, feed.entries[0])
+            entries.append(bib_entry)
+    except:
+        pass
+
+    return entries
+
+
+def get_bib_from_semantic_scholar(url):
+    """
+    Gets a Semantic Scholar paper page and returns a list of pybtex.database.BibliographyData with a single bib entry
+    :param url: the URL of the Semantic Scholar paper page
+    :return: a list of pybtex.database.BibliographyData with a single bib entry or an empty list
+    if not found / an error occurred
+    """
+    entries = []
+    try:
+        page = urllib.request.urlopen(url)
+        soup = BeautifulSoup(page, 'html.parser')
+
+        # Get the JSON paper info
+        info = soup.find('script', {'class': 'schema-data'}).string
+        info = json.loads(info)
+
+        fields = { 'key': info['@graph'][1]['author'][0]['name'].split()[-1] + info['@graph'][1]['datePublished'],
+                   'title': info['@graph'][1]['headline'],
+                   'booktitle': info['@graph'][1]['publication'],
+                   'year': info['@graph'][1]['datePublished'] }
+
+        authors = {'author': [pybtex.Person(author['name']) for author in info['@graph'][1]['author']]}
+        entries.append(pybtex.Entry('inproceedings', persons=authors, fields=fields))
+
+    except:
+        pass
+
+    return entries
+
+
+def get_title_from_pdf(url, temp_dir):
+    """
+    Reads a paper title from a pdf
+    :param url: the URL of the pdf file
+    :return: the paper title or None if not found / error occurred
+    """
+    title = None
+
+    try:
+
+        # Download the file to a temporary file
+        data = urllib.request.urlopen(url).read()
+        with open(os.join(temp_dir, 'temp.pdf'), 'wb') as f_out:
+            f_out.write(data)
+
+        # Get the "title" - first line in the file
+        text = textract.process('temp.pdf').decode('utf-8')
+
+        # Search for it in the ACL anthology
+        title = text.split('\n')[0]
+    except:
+        pass
+
+    return title
+
+
 def _macros(args, config):
     for macro, expansion in config.macros.items():
         print("%s:\t%s" % (macro, expansion))
@@ -558,6 +806,12 @@ def main():
     parser_rm.add_argument('terms', nargs='*', help='One or more search terms')
     parser_rm.set_defaults(func=_remove)
 
+    parser_crawl = subparsers.add_parser('crawl', help='Search for links to papers on a given web site URL')
+    parser_crawl.add_argument('url', type=str, default=None, help='The URL of the web site')
+    parser_crawl.add_argument("-a", "--add", action='store_true',
+                              help="Add all results to the database (default: just print them to STDOUT)")
+    parser_crawl.set_defaults(func=_crawl)
+
     parser_macros = subparsers.add_parser('macros', help='Show defined macros')
     parser_macros.set_defaults(func=_macros)
 
@@ -565,6 +819,7 @@ def main():
     config = Config()
     config.initialize(args.config_file)
     args.func(args, config)
+
 
 if __name__ == '__main__':
     main()
