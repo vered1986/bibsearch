@@ -502,9 +502,7 @@ def _crawl(args, config):
     """
     Crawls a web site for links of papers and returns their bib files.
     Bib entries are retrieved from ACL anthology, Semantic Scholar, and arXiv.
-    :return:
     """
-    #TODO: handle duplicate entries
     db = BibDB(config)
 
     # Read the references
@@ -525,14 +523,20 @@ def _crawl(args, config):
     for link in links:
         entries = get_bib_entry(entries, link, config, db)
 
+    # Remove duplicates
+    entries = { '{}{}:{}'.format(entry.persons.values()[0][0].last_names[0].lower(),
+                                 entry.fields['year'],
+                                 entry.fields['title'].split()[0].lower()) : entry
+                for entry in entries}
+
     # Run through each entry, and print out information
     results_to_save = []
-    for bib_entry in entries:
+    for custom_key, bib_entry in entries.items():
         if args.add:
             db.add(bib_entry)
-        results_to_save.append((bibutils.single_entry_to_fulltext(bib_entry), bib_entry.key))
-        # else:
-        #     results_to_save.append((bibutils.single_entry_to_fulltext(bib_entry), bib_entry.fields['key']))
+            results_to_save.append((bibutils.single_entry_to_fulltext(bib_entry), bib_entry.key))
+        else:
+            results_to_save.append((bibutils.single_entry_to_fulltext(bib_entry), custom_key))
 
         print(format_search_results(results_to_save))
         db.save_to_search_cache(results_to_save)
@@ -572,7 +576,7 @@ def get_bib_entry(entries, url, config, db):
         arxiv_entry = get_from_arxiv(paper_id, config.custom_key_format)
         curr_entries = []
 
-        # First, try searching for the title in the ACL anthology. If the paper
+        # First, try searching for the title in the DB. If the paper
         # was published in a *CL conference, it should be cited from there and not from arXiv
         if len(arxiv_entry) > 0:
             acl_entry = db.search(arxiv_entry[0].fields['title'])
@@ -597,7 +601,7 @@ def get_bib_entry(entries, url, config, db):
         semantic_scholar_entry = get_bib_from_semantic_scholar(url)
         curr_entries = []
 
-        # First, try searching for the title in the ACL anthology. If the paper
+        # First, try searching for the title in the DB. If the paper
         # was published in a *CL conference, it should be cited from there and not from Semantic Scholar
         if len(semantic_scholar_entry) > 0:
             acl_entry = db.search(semantic_scholar_entry[0].fields['title'])
@@ -677,7 +681,6 @@ def get_from_arxiv(paper_id, custom_key_format=True):
         feedparser._FeedParserMixin.namespaces['http://arxiv.org/schemas/atom'] = 'arxiv'
         feed = feedparser.parse(response)
 
-
         if len(feed.entries) > 0:
             arxiv_id, bib_entry = arxiv_entry_to_bib_entry(custom_key_format, feed.entries[0])
             entries.append(bib_entry)
@@ -703,7 +706,10 @@ def get_bib_from_semantic_scholar(url):
         info = soup.find('script', {'class': 'schema-data'}).string
         info = json.loads(info)
 
-        fields = { 'key': info['@graph'][1]['author'][0]['name'].split()[-1] + info['@graph'][1]['datePublished'],
+        # Key: first author's last name + year + colon + first word of the title
+        fields = { 'key': '{}{}:{}'.format(info['@graph'][1]['author'][0]['name'].split()[-1].lower(),
+                                           info['@graph'][1]['datePublished'],
+                                           info['@graph'][1]['headline'].split()[0].lower()),
                    'title': info['@graph'][1]['headline'],
                    'booktitle': info['@graph'][1]['publication'],
                    'year': info['@graph'][1]['datePublished'] }
